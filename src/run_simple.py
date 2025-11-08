@@ -21,6 +21,8 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 import time
+import json
+from pathlib import Path
 print("✓ PyTorch imported")
 sys.stdout.flush()
 
@@ -239,6 +241,45 @@ print(f"  AUC-ROC:     {float(ensemble_metrics['auc']):.4f}")
 print(f"  GCN Weight:  {float(ensemble_metrics['gcn_weight']):.4f}")
 print(f"  GAT Weight:  {float(ensemble_metrics['gat_weight']):.4f}")
 print(f"  TP: {ensemble_metrics['TP']}, TN: {ensemble_metrics['TN']}, FP: {ensemble_metrics['FP']}, FN: {ensemble_metrics['FN']}")
+sys.stdout.flush()
+
+# Save trained models and statistics for dashboard reuse
+print("\nSaving models and training statistics...")
+artifact_dir = Path('../artifacts').resolve()
+artifact_dir.mkdir(parents=True, exist_ok=True)
+
+torch.save(models['NN'].state_dict(), artifact_dir / 'nn.pt')
+torch.save(models['GCN'].state_dict(), artifact_dir / 'gcn.pt')
+torch.save(models['GCN-EW'].state_dict(), artifact_dir / 'gcn_ew.pt')
+torch.save(models['GAT'].state_dict(), artifact_dir / 'gat.pt')
+torch.save({'alpha': ensemble_model.get_alpha()}, artifact_dir / 'ensemble_meta.pt')
+
+def _to_float_list(values):
+    return [float(v) for v in values] if values else []
+
+stats_payload = {}
+for name, model in models.items():
+    stat = getattr(model, 'stat', {})
+    stats_payload[name] = {
+        'loss_train': _to_float_list(stat.get('loss_train', [])),
+        'loss_val': _to_float_list(stat.get('loss_val', [])),
+        'acc_train': _to_float_list(stat.get('acc_train', [])),
+        'acc_val': _to_float_list(stat.get('acc_val', []))
+    }
+
+# Store ensemble metrics as well
+ensemble_stats_payload = {}
+for key, value in ensemble_metrics.items():
+    try:
+        ensemble_stats_payload[key] = float(value)
+    except (TypeError, ValueError):
+        ensemble_stats_payload[key] = value
+stats_payload['Ensemble'] = ensemble_stats_payload
+
+with open(artifact_dir / 'training_stats.json', 'w') as f:
+    json.dump(stats_payload, f, indent=2)
+
+print(f"✓ Saved artifacts to {artifact_dir}")
 sys.stdout.flush()
 
 print("\n" + "="*80)

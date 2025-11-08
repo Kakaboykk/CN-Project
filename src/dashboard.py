@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ag_utils import Corpus, parse_ag_file, parse_node_properties
 from models import NN, GCN, GAT, GCN_EW
 from model_utils import evaluate_performance, predict_prob
+from ensemble_model import EnsembleModel, evaluate_ensemble, predict_ensemble_prob
 from sklearn.metrics import roc_curve, auc, precision_recall_curve, f1_score
 
 # Page configuration
@@ -121,6 +122,75 @@ def load_data_and_models():
     for name, model in models.items():
         model.name = name
         model.action_mask = action_mask
+
+    # Attempt to load trained weights/statistics
+    artifacts_dir = Path(project_root) / 'artifacts'
+    models_trained = False
+    alpha = 0.6
+
+    if artifacts_dir.exists():
+        state_files = {
+            'NN': artifacts_dir / 'nn.pt',
+            'GCN': artifacts_dir / 'gcn.pt',
+            'GCN-EW': artifacts_dir / 'gcn_ew.pt',
+            'GAT': artifacts_dir / 'gat.pt'
+        }
+
+        loaded_models = []
+        for name, path in state_files.items():
+            if path.exists():
+                try:
+                    models[name].load_state_dict(torch.load(path, map_location='cpu'))
+                    loaded_models.append(name)
+                except Exception as exc:
+                    st.warning(f"⚠️ Failed to load weights for {name}: {exc}")
+
+        models_trained = len(loaded_models) == len(state_files)
+
+        # Load training statistics if available
+        stats_path = artifacts_dir / 'training_stats.json'
+        if stats_path.exists():
+            try:
+                with open(stats_path, 'r') as f:
+                    stats_data = json.load(f)
+                for name, model in models.items():
+                    stat_entry = stats_data.get(name, {})
+                    model.stat = {
+                        'loss_train': stat_entry.get('loss_train', []),
+                        'loss_val': stat_entry.get('loss_val', []),
+                        'acc_train': stat_entry.get('acc_train', []),
+                        'acc_val': stat_entry.get('acc_val', [])
+                    }
+            except Exception as exc:
+                st.warning(f"⚠️ Failed to load training statistics: {exc}")
+
+        ensemble_meta = artifacts_dir / 'ensemble_meta.pt'
+        if ensemble_meta.exists():
+            try:
+                alpha_info = torch.load(ensemble_meta, map_location='cpu')
+                alpha = float(alpha_info.get('alpha', alpha))
+            except Exception as exc:
+                st.warning(f"⚠️ Failed to load ensemble metadata: {exc}")
+
+    # Create ensemble model (even if weights missing, will use default alpha)
+    ensemble_model = EnsembleModel(
+        gcn_model=models['GCN'],
+        gat_model=models['GAT'],
+        alpha=alpha,
+        learnable_alpha=False
+    )
+    ensemble_model.name = 'Ensemble'
+    ensemble_model.action_mask = action_mask
+
+    # Ensure models have stat attribute to avoid attribute errors
+    for model in models.values():
+        if not hasattr(model, 'stat'):
+            model.stat = {
+                'loss_train': [],
+                'loss_val': [],
+                'acc_train': [],
+                'acc_val': []
+            }
     
     return {
         'nodes': nodes,
@@ -132,7 +202,9 @@ def load_data_and_models():
         'X_test': X_test,
         'Y_test': Y_test,
         'models': models,
-        'rt_meas_dim': rt_meas_dim
+        'rt_meas_dim': rt_meas_dim,
+        'ensemble_model': ensemble_model,
+        'models_trained': models_trained
     }
 
 def create_attack_graph_visualization(nodes, edges, node_dict):
@@ -176,7 +248,7 @@ def create_attack_graph_visualization(nodes, edges, node_dict):
         net.save_graph(tmp_file.name)
         return tmp_file.name
 
-def plot_roc_curves(models, X_test, Y_test, edge_index, rt_meas_dim):
+def plot_roc_curves(models, X_test, Y_test, edge_index, rt_meas_dim, ensemble_model=None):
     """Plot ROC curves for all models"""
     fig = go.Figure()
     
@@ -207,6 +279,21 @@ def plot_roc_curves(models, X_test, Y_test, edge_index, rt_meas_dim):
         line=dict(color='navy', width=2, dash='dash'),
         hovertemplate='Random<extra></extra>'
     ))
+
+    # Ensemble curve
+    if ensemble_model is not None:
+        ensemble_prob = predict_ensemble_prob(ensemble_model, X_test, edge_index, rt_meas_dim)
+        ensemble_y_probs = ensemble_prob.view(-1, 2)
+        fpr, tpr, _ = roc_curve(Y_test.view(-1).numpy(), ensemble_y_probs[:, 1].numpy())
+        roc_auc = auc(fpr, tpr)
+        fig.add_trace(go.Scatter(
+            x=fpr,
+            y=tpr,
+            mode='lines',
+            name=f'Ensemble (AUC = {roc_auc:.4f})',
+            line=dict(color='#9b59b6', width=4, dash='dot'),
+            hovertemplate='FPR: %{x:.3f}<br>TPR: %{y:.3f}<extra></extra>'
+        ))
     
     fig.update_layout(
         title='ROC Curves - All Models',
@@ -220,7 +307,7 @@ def plot_roc_curves(models, X_test, Y_test, edge_index, rt_meas_dim):
     
     return fig
 
-def plot_precision_recall_curves(models, X_test, Y_test, edge_index, rt_meas_dim):
+def plot_precision_recall_curves(models, X_test, Y_test, edge_index, rt_meas_dim, ensemble_model=None):
     """Plot Precision-Recall curves for all models"""
     fig = go.Figure()
     
@@ -254,10 +341,27 @@ def plot_precision_recall_curves(models, X_test, Y_test, edge_index, rt_meas_dim
         height=500,
         legend=dict(x=0.7, y=0.2)
     )
+
+    if ensemble_model is not None:
+        ensemble_prob = predict_ensemble_prob(ensemble_model, X_test, edge_index, rt_meas_dim)
+        ensemble_y_probs = ensemble_prob.view(-1, 2)
+        precision, recall, _ = precision_recall_curve(
+            Y_test.view(-1).numpy(),
+            ensemble_y_probs[:, 1].numpy()
+        )
+        pr_auc = auc(recall, precision)
+        fig.add_trace(go.Scatter(
+            x=recall,
+            y=precision,
+            mode='lines',
+            name=f'Ensemble (AUC = {pr_auc:.4f})',
+            line=dict(color='#9b59b6', width=4, dash='dot'),
+            hovertemplate='Recall: %{x:.3f}<br>Precision: %{y:.3f}<extra></extra>'
+        ))
     
     return fig
 
-def plot_f1_scores(models, X_test, Y_test, edge_index, rt_meas_dim):
+def plot_f1_scores(models, X_test, Y_test, edge_index, rt_meas_dim, ensemble_model=None):
     """Plot F1 scores for different thresholds"""
     fig = go.Figure()
     
@@ -293,10 +397,29 @@ def plot_f1_scores(models, X_test, Y_test, edge_index, rt_meas_dim):
         height=500,
         legend=dict(x=0.7, y=0.2)
     )
+
+    if ensemble_model is not None:
+        thresholds = np.linspace(0.1, 0.9, 50)
+        ensemble_prob = predict_ensemble_prob(ensemble_model, X_test, edge_index, rt_meas_dim)
+        y_probs = ensemble_prob.view(-1, 2)[:, 1].numpy()
+        y_true = Y_test.view(-1).numpy()
+        f1_scores = []
+        for threshold in thresholds:
+            y_pred = (y_probs >= threshold).astype(int)
+            f1 = f1_score(y_true, y_pred)
+            f1_scores.append(f1)
+        fig.add_trace(go.Scatter(
+            x=thresholds,
+            y=f1_scores,
+            mode='lines',
+            name='Ensemble',
+            line=dict(color='#9b59b6', width=4, dash='dot'),
+            hovertemplate='Threshold: %{x:.3f}<br>F1 Score: %{y:.3f}<extra></extra>'
+        ))
     
     return fig
 
-def predict_from_json(json_data, models, edge_index, rt_meas_dim, action_mask):
+def predict_from_json(json_data, models, edge_index, rt_meas_dim, action_mask, ensemble_model=None):
     """Make prediction from JSON input"""
     try:
         # Parse JSON input
@@ -328,6 +451,17 @@ def predict_from_json(json_data, models, edge_index, rt_meas_dim, action_mask):
                 'predictions': (prob_1 > 0.5).int().tolist(),
                 'max_prob': prob_1.max().item(),
                 'mean_prob': prob_1.mean().item()
+            }
+        
+        if ensemble_model is not None:
+            ensemble_prob = predict_ensemble_prob(ensemble_model, features, edge_index, rt_meas_dim)
+            prob_1 = ensemble_prob[:, :, 1]
+            results['Ensemble'] = {
+                'probabilities': prob_1.tolist(),
+                'predictions': (prob_1 > 0.5).int().tolist(),
+                'max_prob': prob_1.max().item(),
+                'mean_prob': prob_1.mean().item(),
+                'alpha': ensemble_model.get_alpha()
             }
         
         return results
@@ -417,7 +551,7 @@ def main():
         st.header("Model Performance Metrics")
         
         # Check if models are trained
-        models_trained = all(hasattr(model, 'stat') for model in data['models'].values())
+        models_trained = data.get('models_trained', False)
         
         if not models_trained:
             st.warning("⚠️ Models are not trained yet. Metrics shown are for untrained models. For accurate results, train the models first using `run_simple.py`")
@@ -431,6 +565,16 @@ def main():
                 data['Y_test'], 
                 data['edge_index']
             )
+            ensemble_model = data.get('ensemble_model')
+            ensemble_metrics = None
+            if ensemble_model is not None:
+                ensemble_metrics = evaluate_ensemble(
+                    ensemble_model,
+                    data['X_test'],
+                    data['Y_test'],
+                    data['edge_index']
+                )
+                metrics.append(ensemble_metrics)
             metrics_df = pd.DataFrame(metrics)
         
         # Metrics table
@@ -447,7 +591,8 @@ def main():
                 data['X_test'], 
                 data['Y_test'], 
                 data['edge_index'],
-                data['rt_meas_dim']
+                data['rt_meas_dim'],
+                data.get('ensemble_model')
             )
             st.plotly_chart(roc_fig, use_container_width=True)  # plotly_chart doesn't have width parameter yet
         
@@ -458,7 +603,8 @@ def main():
                 data['X_test'], 
                 data['Y_test'], 
                 data['edge_index'],
-                data['rt_meas_dim']
+                data['rt_meas_dim'],
+                data.get('ensemble_model')
             )
             st.plotly_chart(pr_fig, use_container_width=True)  # plotly_chart doesn't have width parameter yet
         
@@ -468,7 +614,8 @@ def main():
             data['X_test'], 
             data['Y_test'], 
             data['edge_index'],
-            data['rt_meas_dim']
+            data['rt_meas_dim'],
+            data.get('ensemble_model')
         )
         st.plotly_chart(f1_fig, use_container_width=True)  # plotly_chart doesn't have width parameter yet
         
@@ -550,7 +697,8 @@ def main():
                         data['models'],
                         data['edge_index'],
                         data['rt_meas_dim'],
-                        data['action_mask']
+                        data['action_mask'],
+                        data.get('ensemble_model')
                     )
                 
                 if 'error' in results:
@@ -568,6 +716,8 @@ def main():
                                 st.metric("Max Probability", f"{result['max_prob']:.4f}")
                             with col2:
                                 st.metric("Mean Probability", f"{result['mean_prob']:.4f}")
+                            if 'alpha' in result:
+                                st.metric("GCN Weight (alpha)", f"{result['alpha']:.2f}")
                             
                             st.write("**Probabilities by Action Node:**")
                             prob_df = pd.DataFrame({
